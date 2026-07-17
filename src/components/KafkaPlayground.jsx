@@ -5,6 +5,15 @@ const MSG_TYPES = ['click', 'purchase', 'view', 'cart', 'search', 'checkout', 'l
 
 function makeId() { return Math.random().toString(36).slice(2, 8) }
 
+// Deterministic key -> partition hash (FNV-1a 32-bit). Kafka uses murmur2 for
+// this; FNV-1a is the same idea for a visualizer: same key always maps to the
+// same partition, which is what guarantees per-key ordering.
+function hashKey(key) {
+  let h = 2166136261
+  for (let i = 0; i < key.length; i++) { h ^= key.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0 }
+  return h >>> 0
+}
+
 function initState(numPartitions = 3, numConsumers = 2) {
   const partitions = Array.from({ length: numPartitions }, (_, i) => ({
     id: i,
@@ -25,12 +34,20 @@ function initState(numPartitions = 3, numConsumers = 2) {
 }
 
 function assignPartitions(partitions, consumers) {
+  // Preserve committed offsets across a rebalance. In real Kafka, offsets live
+  // in the group (__consumer_offsets), so when a partition moves to a new owner
+  // it resumes from the last committed offset rather than restarting at 0.
+  const prevOffsets = {}
+  consumers.forEach(c => {
+    Object.entries(c.offsets || {}).forEach(([pid, off]) => { prevOffsets[pid] = off })
+  })
   consumers.forEach(c => { c.assignments = []; c.offsets = {}; c.lag = {} })
   partitions.forEach((p, i) => {
     const c = consumers[i % consumers.length]
     c.assignments.push(p.id)
-    c.offsets[p.id] = 0
-    c.lag[p.id] = 0
+    const committed = prevOffsets[p.id] || 0
+    c.offsets[p.id] = committed
+    c.lag[p.id] = Math.max(0, (p.latestOffset || 0) - committed)
   })
 }
 
@@ -56,18 +73,23 @@ export default function KafkaPlayground() {
     setState(prev => {
       const s = JSON.parse(JSON.stringify(prev))
       const msgType = MSG_TYPES[Math.floor(Math.random() * MSG_TYPES.length)]
-      const partIdx = overridePartition !== null
+      const key = `user-${Math.floor(Math.random() * 100)}`
+      // An explicit partition (manual "→ P" button) wins; otherwise route by
+      // hash(key) % numPartitions, exactly like Kafka's default partitioner for
+      // keyed messages. typeof check avoids treating a click event as a partition.
+      const partIdx = typeof overridePartition === 'number'
         ? overridePartition
-        : s.producerCount % s.partitions.length
+        : hashKey(key) % s.partitions.length
       const p = s.partitions[partIdx]
+      if (!p) return prev  // safety: never crash on an invalid partition index
       const msg = {
         id: makeId(),
         offset: p.latestOffset,
         type: msgType,
-        key: `user-${Math.floor(Math.random() * 100)}`,
+        key,
         ts: Date.now(),
       }
-      p.messages = [...p.messages.slice(-14), msg]
+      p.messages = [...p.messages.slice(-99), msg]
       p.latestOffset++
       s.producerCount++
       s.totalMessages++
@@ -76,7 +98,7 @@ export default function KafkaPlayground() {
           c.lag[partIdx] = p.latestOffset - (c.offsets[partIdx] || 0)
         }
       })
-      addLog(`📨 Produced [${msgType}] → Partition-${partIdx} offset=${msg.offset}`, 'var(--cyan)')
+      addLog(`📨 Produced [${msgType}] key=${key} → Partition-${partIdx} offset=${msg.offset}`, 'var(--cyan)')
       setFlowMsgs(f => [...f, { id: makeId(), partIdx, dir: 'produce', ts: Date.now() }])
       return s
     })
@@ -89,7 +111,12 @@ export default function KafkaPlayground() {
       s.consumers.forEach(consumer => {
         consumer.assignments.forEach(partIdx => {
           const p = s.partitions[partIdx]
-          const offset = consumer.offsets[partIdx] || 0
+          if (!p) return
+          let offset = consumer.offsets[partIdx] || 0
+          // If the committed offset fell out of retention (old messages pruned),
+          // reset to the earliest available offset — Kafka's auto.offset.reset=earliest.
+          const earliest = p.messages.length ? p.messages[0].offset : offset
+          if (offset < earliest) offset = earliest
           const msg = p.messages.find(m => m.offset === offset)
           if (msg) {
             consumer.offsets[partIdx] = offset + 1
@@ -241,7 +268,7 @@ export default function KafkaPlayground() {
         <button className={`btn-run ${isRunning ? 'running' : ''}`} onClick={() => setIsRunning(r => !r)}>
           {isRunning ? '⏸ Pause' : '▶ Auto Run'}
         </button>
-        <button className="btn-step" onClick={produce}>+ Produce</button>
+        <button className="btn-step" onClick={() => produce()}>+ Produce</button>
         <button className="btn-step" onClick={consume}>↓ Consume</button>
         <button className="btn-reset" onClick={reset}>↺ Reset</button>
       </div>
@@ -269,7 +296,7 @@ function ProducerPanel({ onProduce, partitions }) {
       <div className="producer-box">
         <div className="producer-icon">P</div>
         <div className="producer-label">Event Stream</div>
-        <div className="producer-sub">round-robin partitioning</div>
+        <div className="producer-sub">hash(key) → partition</div>
         <div className="producer-arrows">
           {partitions.map(p => (
             <button key={p.id} className="p-arrow-btn" onClick={() => onProduce(p.id)}>
